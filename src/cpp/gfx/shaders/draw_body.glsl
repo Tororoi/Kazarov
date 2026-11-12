@@ -49,6 +49,18 @@ layout(location = 1) in vec2 v_uv;
 layout(location = 2) in vec4 v_fog;
 // xy: near/far limits; z: -2 constant, -1 direct 2D, 0 DC1 mesh, 1 DC2 prog0; w: constant F.
 layout(location = 3) flat in vec4 v_fog_mode;
+// A reflection map's facing (mesh.vert's kReflect): w 1 to sample the texture there instead of at v_uv.
+layout(location = 4) in vec4 v_reflect;
+// A reflection cube's block (mesh.vert's kReflectCube): top left corner and one face's size.
+layout(location = 5) flat in vec4 v_cube;
+// Its texel's scale and what is added to it.
+layout(location = 6) flat in vec4 v_tint;
+layout(location = 7) flat in vec4 v_lift;
+
+
+// Where this pixel samples its texture: v_uv, or its facing for a reflection map (the texture's centre facing the
+// camera, its rim edge-on). Set first thing in main.
+vec2 s_uv;
 
 layout(location = 0, index = 0) out vec4 o_color;
 #ifndef KZ_SINGLE_SOURCE
@@ -78,8 +90,26 @@ float Bilerp(vec4 gathered, vec2 f) {
     return mix(mix(gathered.w, gathered.z, f.x), mix(gathered.x, gathered.y, f.x), f.y);
 }
 
+// gfx::kReflectCubeAxis and kReflectCubeDown.
+const vec3 kCubeAxis[6] = vec3[6](vec3(1, 0, 0), vec3(-1, 0, 0), vec3(0, 1, 0), vec3(0, -1, 0), vec3(0, 0, 1), vec3(0, 0, -1));
+const vec3 kCubeDown[6] = vec3[6](vec3(0, -1, 0), vec3(0, -1, 0), vec3(0, 0, 1), vec3(0, 0, -1), vec3(0, -1, 0), vec3(0, -1, 0));
+
+// Where the reflected ray leaves the cube, in the block: the face it meets, across it right and down from the corner.
+vec2 CubeUv(vec3 ray, float hand) {
+    vec3 a = abs(ray);
+    int  face = a.x >= a.y && a.x >= a.z ? (ray.x > 0.0 ? 0 : 1) : a.y >= a.z ? (ray.y > 0.0 ? 2 : 3) : (ray.z > 0.0 ? 4 : 5);
+    vec3 axis  = kCubeAxis[face];
+    vec3 down  = kCubeDown[face];
+    vec3 right = cross(down, axis) * hand;
+    float ahead = dot(ray, axis);
+    // Half a texel in from the face's edges, so its neighbour in the block never bleeds in.
+    vec2 inset = 0.5 / (v_cube.zw * vec2(textureSize(TEXTURE, 0)));
+    vec2 st    = clamp(0.5 + 0.5 * vec2(dot(ray, right), dot(ray, down)) / ahead, inset, 1.0 - inset);
+    return v_cube.xy + (vec2(face % 3, face / 3) + st) * v_cube.zw;
+}
+
 vec2 Footprint() {
-    return fract(v_uv * vec2(textureSize(TEXTURE, 0)) - 0.5);
+    return fract(s_uv * vec2(textureSize(TEXTURE, 0)) - 0.5);
 }
 
 // The footprint's shared corner. Gathering at v_uv itself lets the hardware's fixed-point pick of
@@ -87,7 +117,7 @@ vec2 Footprint() {
 // neighbouring footprint under the old weights.
 vec2 FootprintCorner() {
     vec2 size = vec2(textureSize(TEXTURE, 0));
-    return (floor(v_uv * size - 0.5) + 1.0) / size;
+    return (floor(s_uv * size - 0.5) + 1.0) / size;
 }
 
 vec4 PaletteEntry(float index) {
@@ -97,7 +127,7 @@ vec4 PaletteEntry(float index) {
 // The GS looks the CLUT up before filtering, so a filtered palette texture blends four entries.
 vec4 SamplePalette() {
     if ((pc.flags & kLinear) == 0u) {
-        return PaletteEntry(texture(TEXTURE, v_uv).r);
+        return PaletteEntry(texture(TEXTURE, s_uv).r);
     }
     vec4 index = textureGather(TEXTURE, FootprintCorner(), 0);
     vec2 f     = Footprint();
@@ -111,7 +141,7 @@ uint ColorFlags() {
 // TEXA expands alpha per texel before filtering too: with AEM a filtered edge between black and
 // coloured texels fades out instead of taking TA0 throughout.
 vec4 SampleRgba() {
-    vec4 t = texture(TEXTURE, v_uv);
+    vec4 t = texture(TEXTURE, s_uv);
     uint flags = ColorFlags();
     if ((flags & kTexa) != 0u) {
         float ta0 = float(pc.alpha >> 24) / 128.0;
@@ -152,6 +182,8 @@ bool AlphaPasses(float alpha) {
 }
 
 void main() {
+    s_uv = v_reflect.w > 1.5 ? CubeUv(v_reflect.xyz, v_reflect.w < 2.5 ? 1.0 : -1.0)
+         : v_reflect.w > 0.5 ? v_reflect.xy * vec2(0.5, -0.5) + 0.5 : v_uv;
     // Alpha is carried in GS units over 128 (1.0 = 0x80) so the alpha test and blend factor see
     // values above 0x80 before the attachment saturates them.
     vec4 color;
@@ -159,6 +191,9 @@ void main() {
         color = vec4(v_color.rgb, v_color.a * kModulate);
     } else {
         vec4 t = kTextureMode == 1 ? SampleRgba() : SamplePalette();
+        if (v_reflect.w > 1.5) {
+            t.rgb = t.rgb * v_tint.rgb + v_lift.rgb;
+        }
         color  = vec4(t.rgb * v_color.rgb * kModulate, t.a * v_color.a * kModulate);
     }
 
